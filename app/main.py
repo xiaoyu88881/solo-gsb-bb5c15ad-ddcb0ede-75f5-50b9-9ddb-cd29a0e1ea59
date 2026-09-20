@@ -53,7 +53,9 @@ def create_plan(request: PlanRequest) -> dict:
                 ),
             )
         seen_ids.add(item_id)
-        items.append((item_id, item.width, item.height, item.quantity))
+        items.append((item_id, item.width, item.height, item.quantity,
+                      (item.bleed.top, item.bleed.right,
+                       item.bleed.bottom, item.bleed.left)))
         quantities[item_id] = item.quantity
 
     locked = []

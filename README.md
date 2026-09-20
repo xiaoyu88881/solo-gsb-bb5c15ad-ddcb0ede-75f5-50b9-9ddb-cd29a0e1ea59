@@ -1,6 +1,6 @@
 # 裁纸排版 API（Guillotine Cutting Plan API）
 
-面向小型印刷店的裁纸排版服务：输入原纸尺寸、切缝宽度和成品清单，按**可旋转的铡刀式切割**规则（每一刀都贯穿当前子矩形）生成多张原纸的排版方案。每张原纸返回成品坐标、旋转标记、利用率、刀数（`cut_count`），以及与坐标完全一致的二叉切割树；切缝计入每一次分割，成品互不重叠、不越界。可选地通过 `max_cuts_per_sheet` 限制每张原纸的刀数，或通过 `gripper_zone` 预留机台叼口（该边整条区域不得放置成品，以一道切缝为 `kerf` 的分割刀切下并记为 waste）。
+面向小型印刷店的裁纸排版服务：输入原纸尺寸、切缝宽度和成品清单，按**可旋转的铡刀式切割**规则（每一刀都贯穿当前子矩形）生成多张原纸的排版方案。每张原纸返回成品坐标、旋转标记、利用率、刀数（`cut_count`），以及与坐标完全一致的二叉切割树；切缝计入每一次分割，成品互不重叠、不越界。每种成品可设置**四边出血（bleed）**：排版、旋转与各类校验均使用“成品净尺寸+四边出血”的生产矩形，旋转 90° 时出血随成品同步旋转。可选地通过 `max_cuts_per_sheet` 限制每张原纸的刀数，或通过 `gripper_zone` 预留机台叼口（该边整条区域不得放置成品，以一道切缝为 `kerf` 的分割刀切下并记为 waste）。
 
 ## 一键启动
 
@@ -34,11 +34,12 @@ docker compose up --build
   "kerf": 3,
   "max_cuts_per_sheet": 40,
   "items": [
-    { "id": "flyer", "width": 210, "height": 148, "quantity": 8 },
+    { "id": "flyer", "width": 210, "height": 148, "quantity": 8,
+      "bleed": { "top": 3, "right": 3, "bottom": 3, "left": 3 } },
     { "id": "card",  "width": 90,  "height": 55,  "quantity": 12 }
   ],
   "locked_placements": [
-    { "item": "flyer", "x": 0, "y": 0, "rotated": false }
+    { "item": "flyer", "x": 3, "y": 3, "rotated": false }
   ],
   "gripper_zone": { "edge": "bottom", "size": 15 }
 }
@@ -50,17 +51,30 @@ docker compose up --build
 | `kerf` | number | `>= 0`，可省略，默认 `0` | 切缝宽度，每刀损耗的材料宽度 |
 | `max_cuts_per_sheet` | integer | 可选，`>= 1`，缺省不限 | 每张原纸允许的最大刀数（按 `cut_tree` 中 `cut` 节点计数） |
 | `items[].id` | string | 可选，需唯一 | 成品标识，缺省自动生成 `item-1`、`item-2`… |
-| `items[].width` / `items[].height` | number | `> 0` | 成品宽/高 |
+| `items[].width` / `items[].height` | number | `> 0` | 成品净尺寸宽/高 |
 | `items[].quantity` | integer | `>= 1` | 需求数量 |
+| `items[].bleed` | object | 可选，缺省四边均为 `0` | 成品四边出血，见下文“出血与生产矩形” |
+| `items[].bleed.top` / `right` / `bottom` / `left` | number | `>= 0`，可省略，默认 `0` | 各边出血宽度 |
 | `locked_placements[]` | array | 可选，默认空 | 预先定位、必须**原样保留**在第一张原纸上的成品 |
 | `locked_placements[].item` | string | 必须出现在 `items[].id` 中 | 被锁定成品标识 |
-| `locked_placements[].x` / `y` | number | `>= 0` | 左上角坐标，旋转后的占位不得越出原纸 |
+| `locked_placements[].x` / `y` | number | `>= 0` | 成品**净尺寸**左上角坐标；引擎据此反推生产矩形（含出血），旋转后的占位不得越出原纸 |
 | `locked_placements[].rotated` | boolean | 可省略，默认 `false` | 是否旋转 90° |
 | `gripper_zone` | object | 可选，缺省无保留区 | 机台叼口保留区：该边整条区域不得放置成品 |
 | `gripper_zone.edge` | string | `top` / `right` / `bottom` / `left` | 叼口所在原纸边 |
 | `gripper_zone.size` | number | `> 0` | 保留区宽度（垂直于该边的尺寸） |
 
 **锁定数量计入需求**：每种成品的锁定件数从其 `quantity` 中扣除，超出 `quantity` 返回 422；锁定项之间不得重叠。锁定布局还必须在给定 `kerf` 下能递归分解为铡刀切割树（每件之间留得出贯穿全矩形的切缝），否则返回 422 并在 `detail` 中指出冲突项的序号（从 1 开始）与 `item` id。验证通过后，引擎只在切割树的**可用余料叶**中放置剩余数量，放不下再开新原纸；锁定成品的坐标永不移动。
+
+**出血（bleed）与生产矩形**：`items[].bleed` 为成品四边分别设置出血宽度（`top`/`right`/`bottom`/`left`，均 `>= 0`，缺省为 `0`）。引擎排版的基本单位是**生产矩形 = 成品净尺寸 + 四边出血**：
+
+- 排版占位、可旋转判断、刀数上限预估、叼口内缩区可容纳判断，全部按生产矩形进行；成品能否放上原纸也取决于生产矩形（两种朝向均放不下时返回 422，`detail` 会注明含出血的生产尺寸）；
+- 成品旋转 90° 时四边出血**随成品同步旋转**（顺时针：原左出血转到上边、原上出血转到右边，依此类推），而不是只交换宽高——生产矩形内净成品的偏移也随之改变；
+- `locked_placements` 的 `x`/`y` 仍表示成品**净尺寸**左上角；引擎据此反推出生产矩形（如未旋转时 `生产矩形.x = x - bleed.left`），并按生产矩形做越界、重叠、叼口和铡刀可分解校验——净尺寸在原纸内但生产矩形越界/重叠/进入叼口时同样返回 422；
+- 响应 `placements[]` 同时返回净尺寸坐标（`x`/`y`/`width`/`height`）和 `production_rect`；`cut_tree` 的 `item` 叶覆盖 `production_rect`；
+- 利用率（`utilization`、`used_area`）继续只计成品**净面积**，出血不计入；
+- 未提供 `bleed`（或四边均为 `0`）时生产矩形等于净尺寸，排版结果与之前完全一致。
+
+最小示例：100×100 原纸、成品 40×30、`bleed: {"top": 1, "right": 2, "bottom": 3, "left": 4}`，则生产矩形为 46×34；排在 `(0, 0)` 时净尺寸坐标为 `(4, 1)`，`production_rect` 为 `(0, 0, 46, 34)`。
 
 **刀数上限（`max_cuts_per_sheet`）**：刀数按每张原纸 `cut_tree` 中的 `cut` 节点计数，第一张原纸上锁定布局产生的刀数同样计入——锁定树自身超限即返回 422。排版选位时只采用预计切分后不超上限的余料，适配程度（短边适配、面积适配）相同时优先新增刀数更少的候选；已开原纸均不可用时新开原纸。若某成品单件在空白原纸上（两种朝向取最少）也无法在上限内形成合法切割树，整个请求返回 422。
 
@@ -98,7 +112,11 @@ docker compose up --build
       "utilization": 0.570444,
       "cut_count": 32,
       "placements": [
-        { "item": "flyer", "x": 0.0, "y": 0.0, "width": 210.0, "height": 148.0, "rotated": false, "locked": true }
+        {
+          "item": "flyer", "x": 3.0, "y": 3.0, "width": 210.0, "height": 148.0,
+          "rotated": false, "locked": true,
+          "production_rect": { "x": 0.0, "y": 0.0, "width": 216.0, "height": 154.0 }
+        }
       ],
       "cut_tree": {
         "type": "cut",
@@ -118,10 +136,10 @@ docker compose up --build
 }
 ```
 
-- `placements[]`：每件成品的左上角坐标、放置后的宽高与 `rotated`（是否旋转 90°；旋转后 `width`/`height` 为原高/宽），以及 `locked`（`true` 表示该件来自请求中的 `locked_placements`，坐标与请求完全一致；锁定件全部位于 `index: 0` 的第一张原纸）。坐标系原点在**原纸左上角**，x 向右、y 向下。
+- `placements[]`：每件成品的**净尺寸**左上角坐标、放置后的净宽高与 `rotated`（是否旋转 90°；旋转后 `width`/`height` 为原高/宽），以及 `locked`（`true` 表示该件来自请求中的 `locked_placements`，坐标与请求完全一致；锁定件全部位于 `index: 0` 的第一张原纸）。`production_rect` 为净尺寸加四边出血后的生产矩形（旋转时出血随成品同步旋转），与 `cut_tree` 中对应 `item` 叶的范围一致；未设置出血时与净尺寸相同。坐标系原点在**原纸左上角**，x 向右、y 向下。
 - `cut_count`：该张原纸切割树中的 `cut` 节点（刀）数，与 `cut_tree` 实际一致；设置 `max_cuts_per_sheet` 时保证不超过上限。
-- `cut_tree`：同时覆盖锁定件与新增件，锁定件对应 `item` 叶的坐标即请求坐标；树中其余的 `waste` 叶即剩余数量可使用的余料。
-- `utilization`：成品面积 ÷ 原纸面积，切缝与边角废料均计入损耗（分子包含锁定件与新增件）。
+- `cut_tree`：同时覆盖锁定件与新增件，`item` 叶即对应成品的生产矩形（锁定件的 `item` 叶为由请求坐标反推出的生产矩形）；树中其余的 `waste` 叶即剩余数量可使用的余料。
+- `utilization`：成品**净面积** ÷ 原纸面积，出血、切缝与边角废料均计入损耗（分子包含锁定件与新增件）。
 - `summary`：总用纸数、总件数（锁定件 + 剩余件，即全部 `items` 数量之和）与整体利用率。
 
 ### 二叉切割树（`cut_tree`）
@@ -132,7 +150,7 @@ docker compose up --build
   - `direction: "vertical"`：竖直一刀，`children[0]` 为左侧、`children[1]` 为右侧；
   - `direction: "horizontal"`：水平一刀，`children[0]` 为上侧、`children[1]` 为下侧；
   - 第二个子节点的起点 = 第一个子节点的终点 + `kerf`（切缝被这刀消耗）。
-- `item`（叶子）：一件成品，坐标与 `placements` 中的条目一一对应。
+- `item`（叶子）：一件成品的**生产矩形**（净尺寸+四边出血，未设置出血时即净尺寸），与 `placements` 中条目的 `production_rect` 一一对应。
 - `waste`（叶子）：剩余边角料（可回收利用的余料）；设置 `gripper_zone` 时，与叼口边等长、整块被切下的叼口保留区也是一片 `waste` 叶（树根分割刀的子节点）。
 
 切割顺序即自根向下的前序遍历。若余料宽度不足一个切缝（刀片会把它完全吃掉），则作为修边损耗，不再产生节点。
@@ -144,7 +162,8 @@ docker compose up --build
 | 状态码 | 情形 |
 | --- | --- |
 | `422` | 输入校验失败：尺寸非正数、数量小于 1、成品列表为空、`id` 重复、`max_cuts_per_sheet` 非正整数等，`detail` 含具体字段 |
-| `422` | 某成品两种朝向都放不进一张原纸，`detail` 明确指出该成品，例如：<br>`item 'poster' (150.0 x 80.0) does not fit on stock 100.0 x 100.0 in either orientation` |
+| `422` | 某成品两种朝向都放不进一张原纸，`detail` 明确指出该成品；设置 `bleed` 时按生产矩形判断并注明生产尺寸，例如：<br>`item 'poster' (150.0 x 80.0) does not fit on stock 100.0 x 100.0 in either orientation` |
+| `422` | 锁定成品的生产矩形（净尺寸+四边出血，旋转时出血同步旋转）越出原纸、相互重叠、进入叼口保留区或跨分割切缝，`detail` 指出该锁定项序号（从 1 开始）与 `item` id |
 | `422` | 某成品单件在空白原纸上所需的最少刀数超过 `max_cuts_per_sheet`，例如：<br>`item 'A' (40.0 x 40.0) needs at least 2 cuts on a fresh sheet 100.0 x 100.0, exceeding max_cuts_per_sheet 1` |
 | `422` | 锁定项引用了不存在的 `item`，或锁定数量超过该成品的 `quantity`，`detail` 指出锁定项序号（`#1`、`#2`…） |
 | `422` | 锁定成品越界、彼此重叠：`locked placements #1 item 'A' and #2 item 'B' overlap` |

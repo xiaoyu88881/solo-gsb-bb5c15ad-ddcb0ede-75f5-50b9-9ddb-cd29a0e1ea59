@@ -22,6 +22,19 @@ class Stock(BaseModel):
     height: float = Field(gt=0, le=MAX_DIMENSION, description="原纸高度")
 
 
+class Bleed(BaseModel):
+    """成品四边出血（均不小于 0，缺省为 0）。"""
+
+    top: float = Field(default=0.0, ge=0.0, le=MAX_DIMENSION,
+                       description="上边出血宽度")
+    right: float = Field(default=0.0, ge=0.0, le=MAX_DIMENSION,
+                         description="右边出血宽度")
+    bottom: float = Field(default=0.0, ge=0.0, le=MAX_DIMENSION,
+                          description="下边出血宽度")
+    left: float = Field(default=0.0, ge=0.0, le=MAX_DIMENSION,
+                        description="左边出血宽度")
+
+
 class Item(BaseModel):
     id: Optional[str] = Field(
         default=None, min_length=1, max_length=64,
@@ -30,6 +43,13 @@ class Item(BaseModel):
     width: float = Field(gt=0, le=MAX_DIMENSION, description="成品宽度")
     height: float = Field(gt=0, le=MAX_DIMENSION, description="成品高度")
     quantity: int = Field(ge=1, le=MAX_QUANTITY, description="需求数量")
+    bleed: Bleed = Field(
+        default_factory=Bleed,
+        description=(
+            "成品四边出血。排版与可旋转判断使用“成品净尺寸+四边出血”的生产矩形；"
+            "缺省四边均为 0，结果与未提供 bleed 完全一致"
+        ),
+    )
 
 
 class GripperZone(BaseModel):
@@ -46,8 +66,10 @@ class LockedPlacement(BaseModel):
     item: str = Field(min_length=1, max_length=64,
                       description="预先定位成品的标识，须出现在 items 中")
     x: float = Field(ge=0, le=MAX_DIMENSION,
-                     description="左上角 X 坐标（原纸左上角为原点）")
-    y: float = Field(ge=0, le=MAX_DIMENSION, description="左上角 Y 坐标")
+                     description="成品净尺寸左上角 X 坐标（原纸左上角为原点）；"
+                                 "越界等校验按其生产矩形（含出血）进行")
+    y: float = Field(ge=0, le=MAX_DIMENSION,
+                     description="成品净尺寸左上角 Y 坐标")
     rotated: bool = Field(default=False, description="是否旋转了 90 度")
 
 
@@ -99,13 +121,26 @@ class PlanRequest(BaseModel):
 
 class Placement(BaseModel):
     item: str = Field(description="成品标识")
-    x: float = Field(description="左上角 X 坐标（原纸左下角为原点）")
-    y: float = Field(description="左上角 Y 坐标")
-    width: float = Field(description="放置后的宽度（旋转后为原高度）")
-    height: float = Field(description="放置后的高度")
+    x: float = Field(description="成品净尺寸左上角 X 坐标（原纸左上角为原点）")
+    y: float = Field(description="成品净尺寸左上角 Y 坐标")
+    width: float = Field(description="成品净尺寸放置宽度（旋转后为原高度）")
+    height: float = Field(description="成品净尺寸放置高度")
     rotated: bool = Field(description="是否旋转了 90 度")
     locked: bool = Field(default=False,
                          description="是否为请求中预先定位（locked）的成品")
+    production_rect: "ProductionRect" = Field(
+        description=(
+            "生产矩形：成品净尺寸加四边出血（旋转时出血随成品同步旋转），"
+            "与 cut_tree 中对应 item 叶的范围一致；未设置出血时与净尺寸相同"
+        ),
+    )
+
+
+class ProductionRect(BaseModel):
+    x: float = Field(description="生产矩形左上角 X 坐标")
+    y: float = Field(description="生产矩形左上角 Y 坐标")
+    width: float = Field(description="生产矩形宽度（含左右出血）")
+    height: float = Field(description="生产矩形高度（含上下出血）")
 
 
 class ItemNode(BaseModel):

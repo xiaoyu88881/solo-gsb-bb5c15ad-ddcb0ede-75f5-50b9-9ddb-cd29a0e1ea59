@@ -26,7 +26,8 @@ class TestBasicPacking:
         assert sheet["utilization"] == 1.0
         assert sheet["placements"] == [
             {"item": "A", "x": 0, "y": 0, "width": 100, "height": 100,
-             "rotated": False, "locked": False}
+             "rotated": False, "locked": False,
+             "production_rect": {"x": 0, "y": 0, "width": 100, "height": 100}}
         ]
         assert sheet["cut_tree"]["type"] == "item"
 
@@ -302,6 +303,167 @@ class TestLockedPlacements:
                          stock_w=n * 11, stock_h=n * 11, kerf=1)
         check_plan(result)
         assert result["summary"]["piece_count"] == n * n
+
+
+# ---------------------------------------------------------------------------
+# bleed (production rectangle)
+# ---------------------------------------------------------------------------
+
+class TestBleed:
+    def test_production_rect_covers_net_plus_bleed(self):
+        result = plan(100, 100, 0, [("A", 40, 30, 1, (1, 2, 3, 4))])
+        check_plan(result)
+        p = result["sheets"][0]["placements"][0]
+        # bleed top=1, right=2, bottom=3, left=4
+        assert (p["x"], p["y"], p["width"], p["height"]) == (4, 1, 40, 30)
+        assert p["production_rect"] == {"x": 0, "y": 0, "width": 46,
+                                        "height": 34}
+        # The cut tree's item leaf spans the production rectangle.
+        (leaf,) = [l for l in iter_leaves(result["sheets"][0]["cut_tree"])
+                   if l["type"] == "item"]
+        assert (leaf["x"], leaf["y"], leaf["width"], leaf["height"]) == (
+            0, 0, 46, 34)
+
+    def test_no_bleed_production_rect_equals_net(self):
+        result = plan(100, 100, 0, [("A", 40, 30, 1)])
+        p = result["sheets"][0]["placements"][0]
+        assert p["production_rect"] == {"x": p["x"], "y": p["y"],
+                                        "width": p["width"],
+                                        "height": p["height"]}
+
+    def test_zero_bleed_matches_no_bleed(self):
+        plain = plan(100, 100, 3, [("A", 40, 40, 3), ("B", 30, 20, 2)])
+        zero = plan(100, 100, 3, [("A", 40, 40, 3, (0, 0, 0, 0)),
+                                  ("B", 30, 20, 2, (0, 0, 0, 0))])
+        assert plain == zero
+
+    def test_bleed_rotates_with_piece(self):
+        # 60x40 with a 10-wide left bleed: unrotated production (70x40)
+        # does not fit a 50-wide stock, rotated (40x70) does.
+        result = plan(50, 100, 0, [("A", 60, 40, 1, (0, 0, 0, 10))])
+        check_plan(result)
+        p = result["sheets"][0]["placements"][0]
+        assert p["rotated"] is True
+        assert (p["width"], p["height"]) == (40, 60)
+        # Rotated production: width = top + 40 + bottom, height = left + 60
+        # + right; the left bleed moved to the top, so the net piece sits
+        # 10 units below the production rect's top edge.
+        assert p["production_rect"] == {"x": 0, "y": 0, "width": 40,
+                                        "height": 70}
+        assert (p["x"], p["y"]) == (0, 10)
+
+    def test_utilization_counts_net_area_only(self):
+        result = plan(100, 100, 0, [("A", 40, 30, 1, (1, 2, 3, 4))])
+        check_plan(result)
+        sheet = result["sheets"][0]
+        assert sheet["utilization"] == round(40 * 30 / 10_000, 6)
+        assert result["summary"]["used_area"] == 1200
+
+    def test_bleed_consumes_space(self):
+        # Two 45x100 pieces with a 5-wide right bleed pack exactly side by
+        # side: production rects [0, 50) and [50, 100).
+        result = plan(100, 100, 0, [("A", 45, 100, 2, (0, 5, 0, 0))])
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 1
+        xs = sorted(p["production_rect"]["x"]
+                    for p in result["sheets"][0]["placements"])
+        assert xs == [0, 50]
+
+    def test_bleed_can_force_an_extra_sheet(self):
+        # Net size 50x100 fits twice per sheet, but the 1-wide bleed
+        # pushes the production rect to 51x100: one piece per sheet.
+        result = plan(100, 100, 0, [("A", 50, 100, 2, (0, 1, 0, 0))])
+        check_plan(result)
+        assert result["summary"]["sheet_count"] == 2
+
+    def test_item_unfit_only_because_of_bleed(self):
+        with pytest.raises(UnfitItemError) as excinfo:
+            plan(100, 100, 0, [("big", 100, 100, 1, (0, 1, 0, 0))])
+        message = str(excinfo.value)
+        assert "big" in message and "production" in message
+
+    def test_cut_limit_uses_production_size(self):
+        # Production rect 100x40 spans the full sheet width: only one cut
+        # is needed (the net 40x40 alone would have needed two).
+        result = build_plan(100, 100, 3, [("A", 40, 40, 1, (0, 60, 0, 0))],
+                            max_cuts_per_sheet=1)
+        check_plan(result)
+        assert result["sheets"][0]["cut_count"] == 1
+
+    def test_locked_net_coordinates_preserved_with_bleed(self):
+        # locked x/y is the net top-left; the production rect is derived.
+        result = _locked([("A", 40, 40, 1, (2, 2, 2, 2))],
+                         [("A", 10, 10, False)], kerf=0)
+        check_plan(result)
+        p = result["sheets"][0]["placements"][0]
+        assert p["locked"] is True
+        assert (p["x"], p["y"]) == (10, 10)
+        assert p["production_rect"] == {"x": 8, "y": 8, "width": 44,
+                                        "height": 44}
+
+    def test_locked_rotated_bleed_rotates_offsets(self):
+        # 60x40 with a 10-wide left bleed, locked rotated: the production
+        # rect is 40x70 and the bleed sits on top of the net piece.
+        result = _locked([("A", 60, 40, 1, (0, 0, 0, 10))],
+                         [("A", 10, 20, True)], kerf=0)
+        check_plan(result)
+        p = result["sheets"][0]["placements"][0]
+        assert p["rotated"] is True
+        assert (p["x"], p["y"], p["width"], p["height"]) == (10, 20, 40, 60)
+        assert p["production_rect"] == {"x": 10, "y": 10, "width": 40,
+                                        "height": 70}
+
+    def test_locked_production_rect_out_of_bounds_rejected(self):
+        # The net rect fits (x=5 on a 100-wide stock) but the 10-wide left
+        # bleed pushes the production rect to x=-5.
+        with pytest.raises(LockedLayoutError) as exc:
+            _locked([("A", 40, 40, 1, (0, 0, 0, 10))], [("A", 5, 0, False)])
+        assert "#1" in str(exc.value)
+
+    def test_locked_bleed_overlap_rejected(self):
+        # Net rects are 4 units apart, but A's right bleed (4) and B's
+        # left bleed (4) make the production rects overlap.
+        items = [("A", 40, 40, 1, (0, 4, 0, 0)),
+                 ("B", 40, 40, 1, (0, 0, 0, 4))]
+        pinned = [("A", 0, 0, False), ("B", 44, 0, False)]
+        with pytest.raises(LockedLayoutError) as exc:
+            _locked(items, pinned, kerf=0)
+        assert "#1" in str(exc.value) and "#2" in str(exc.value)
+
+    def test_locked_bleed_guillotine_gap(self):
+        # Production rects are 45 wide (net 40 + right bleed 5); a kerf-5
+        # cut separates them exactly.
+        items = [("A", 40, 100, 2, (0, 5, 0, 0))]
+        pinned = [("A", 0, 0, False), ("A", 50, 0, False)]
+        result = _locked(items, pinned, stock_w=100, stock_h=100, kerf=5)
+        check_plan(result)
+        xs = sorted(p["production_rect"]["x"]
+                    for p in result["sheets"][0]["placements"])
+        assert xs == [0, 50]
+
+    def test_locked_bleed_touching_production_rects_with_kerf_rejected(self):
+        # Production rects touch (gap 0) but the kerf is 5.
+        items = [("A", 40, 100, 2, (0, 5, 0, 0))]
+        pinned = [("A", 0, 0, False), ("A", 45, 0, False)]
+        with pytest.raises(LockedLayoutError):
+            _locked(items, pinned, stock_w=100, stock_h=100, kerf=5)
+
+    def test_locked_bleed_entering_gripper_rejected(self):
+        # Net top-left y=12 clears the separator (size 10 + kerf 2), but
+        # the 5-wide top bleed pulls the production rect up to y=7, inside
+        # the keep-out zone.
+        with pytest.raises(GripperZoneError):
+            build_plan(100, 100, 2, [("A", 40, 40, 1, (5, 0, 0, 0))],
+                       locked=[("A", 0, 12, False, 1)],
+                       gripper=("top", 10))
+
+    def test_locked_bleed_respecting_gripper_accepted(self):
+        result = build_plan(100, 100, 2, [("A", 40, 40, 1, (5, 0, 0, 0))],
+                            locked=[("A", 0, 17, False, 1)],
+                            gripper=("top", 10))
+        check_plan(result)
+        p = result["sheets"][0]["placements"][0]
+        assert p["production_rect"]["y"] == 12
 
 
 # ---------------------------------------------------------------------------
