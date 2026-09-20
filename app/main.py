@@ -14,10 +14,12 @@ from .packer import (
 
 app = FastAPI(
     title="Guillotine Cutting Plan API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "面向小型印刷店的裁纸排版服务：给定原纸尺寸、切缝宽度和成品清单，"
         "按可旋转的铡刀式（每刀贯穿当前子矩形）规则生成多张原纸的排版方案。"
+        "支持成品四边出血（bleed）：排版、旋转与校验均以净尺寸加出血的"
+        "生产矩形为准，利用率仍只计成品净面积。"
     ),
 )
 
@@ -37,9 +39,11 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/plans", response_model=PlanResponse)
+@app.post("/plans", response_model=PlanResponse,
+          response_model_exclude_none=True)
 def create_plan(request: PlanRequest) -> dict:
     items = []
+    bleeds = {}
     seen_ids = set()
     quantities = {}
     for position, item in enumerate(request.items, start=1):
@@ -54,6 +58,9 @@ def create_plan(request: PlanRequest) -> dict:
             )
         seen_ids.add(item_id)
         items.append((item_id, item.width, item.height, item.quantity))
+        bleed = item.bleed
+        bleeds[item_id] = ((bleed.top, bleed.right, bleed.bottom, bleed.left)
+                           if bleed is not None else (0.0, 0.0, 0.0, 0.0))
         quantities[item_id] = item.quantity
 
     locked = []
@@ -94,6 +101,7 @@ def create_plan(request: PlanRequest) -> dict:
             locked=locked,
             max_cuts_per_sheet=request.max_cuts_per_sheet,
             gripper=gripper,
+            bleeds=bleeds,
         )
     except (UnfitItemError, LockedLayoutError, CutLimitError,
             GripperZoneError) as exc:

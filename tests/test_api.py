@@ -510,3 +510,205 @@ def test_gripper_zone_with_locked_within_limit():
     response = client.post("/plans", json=payload)
     assert response.status_code == 200
     check_plan(response.json())
+
+
+# ---------------------------------------------------------------------------
+# bleed (四边出血)
+# ---------------------------------------------------------------------------
+
+BLEED_PAYLOAD = {
+    "stock": {"width": 100, "height": 100},
+    "kerf": 0,
+    "items": [
+        {"id": "A", "width": 40, "height": 40, "quantity": 1,
+         "bleed": {"top": 5, "right": 5, "bottom": 5, "left": 5}},
+    ],
+}
+
+
+def test_bleed_happy_path_returns_production_rect():
+    response = client.post("/plans", json=BLEED_PAYLOAD)
+    assert response.status_code == 200
+    body = response.json()
+    check_plan(body)
+    p = body["sheets"][0]["placements"][0]
+    # Net coordinates are inset by the bleed from the production rect.
+    assert (p["x"], p["y"], p["width"], p["height"]) == (5.0, 5.0, 40.0, 40.0)
+    assert p["production_rect"] == {"x": 0.0, "y": 0.0,
+                                    "width": 50.0, "height": 50.0}
+    # The cut tree item leaf covers the production rectangle.
+    leaf = body["sheets"][0]["cut_tree"]
+    while leaf["type"] == "cut":
+        leaf = leaf["children"][0]
+    assert leaf["type"] == "item"
+    assert (leaf["x"], leaf["y"], leaf["width"], leaf["height"]) == (
+        0.0, 0.0, 50.0, 50.0)
+
+
+def test_bleed_defaults_keep_response_compatible():
+    body = client.post("/plans", json=VALID_PAYLOAD).json()
+    assert all("production_rect" not in p
+               for s in body["sheets"] for p in s["placements"])
+
+
+def test_bleed_explicit_zero_keeps_response_compatible():
+    payload = dict(VALID_PAYLOAD)
+    payload["items"] = [
+        {**item, "bleed": {"top": 0, "right": 0, "bottom": 0, "left": 0}}
+        for item in VALID_PAYLOAD["items"]
+    ]
+    assert client.post("/plans", json=payload).json() == \
+        client.post("/plans", json=VALID_PAYLOAD).json()
+
+
+def test_bleed_explicit_null_keeps_response_compatible():
+    payload = dict(VALID_PAYLOAD)
+    payload["items"] = [{**item, "bleed": None} for item in VALID_PAYLOAD["items"]]
+    assert client.post("/plans", json=payload).json() == \
+        client.post("/plans", json=VALID_PAYLOAD).json()
+
+
+def test_bleed_negative_side_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 10, "height": 10, "quantity": 1,
+                   "bleed": {"left": -1}}],
+    }
+    assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_bleed_partial_sides_default_to_zero():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1,
+                   "bleed": {"left": 5}}],
+    }
+    body = client.post("/plans", json=payload).json()
+    check_plan(body)
+    p = body["sheets"][0]["placements"][0]
+    assert p["production_rect"] == {"x": 0.0, "y": 0.0,
+                                    "width": 45.0, "height": 40.0}
+    assert (p["x"], p["y"]) == (5.0, 0.0)
+
+
+def test_bleed_utilization_counts_net_area_only():
+    body = client.post("/plans", json=BLEED_PAYLOAD).json()
+    sheet = body["sheets"][0]
+    assert sheet["utilization"] == pytest.approx(1600 / 10000)
+    assert body["summary"]["used_area"] == pytest.approx(1600)
+
+
+def test_bleed_rotates_with_locked_piece():
+    # Rotated 90° clockwise: sheet-frame bleed is top=left(4),
+    # right=top(1), bottom=right(2), left=bottom(3).
+    payload = {
+        "stock": {"width": 300, "height": 300},
+        "items": [{"id": "A", "width": 100, "height": 50, "quantity": 1,
+                   "bleed": {"top": 1, "right": 2, "bottom": 3, "left": 4}}],
+        "locked_placements": [{"item": "A", "x": 10, "y": 20,
+                               "rotated": True}],
+    }
+    body = client.post("/plans", json=payload).json()
+    check_plan(body)
+    p = body["sheets"][0]["placements"][0]
+    assert (p["x"], p["y"]) == (10.0, 20.0)  # net coords as requested
+    assert (p["width"], p["height"]) == (50.0, 100.0)
+    assert p["production_rect"] == {"x": 7.0, "y": 16.0,
+                                    "width": 54.0, "height": 106.0}
+
+
+def test_locked_bleed_outside_stock_rejected():
+    # Net rect is inside the stock, but the left bleed crosses the edge.
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1,
+                   "bleed": {"left": 5}}],
+        "locked_placements": [{"item": "A", "x": 0, "y": 0}],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    assert "#1" in response.json()["detail"]
+
+
+def test_locked_bleed_overlap_rejected():
+    # Net rects are 5 apart, but the facing bleeds overlap.
+    payload = {
+        "stock": {"width": 200, "height": 100},
+        "items": [
+            {"id": "A", "width": 40, "height": 40, "quantity": 1,
+             "bleed": {"right": 5}},
+            {"id": "B", "width": 40, "height": 40, "quantity": 1,
+             "bleed": {"left": 5}},
+        ],
+        "locked_placements": [
+            {"item": "A", "x": 0, "y": 0},
+            {"item": "B", "x": 45, "y": 0},
+        ],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    assert "overlap" in response.json()["detail"]
+
+
+def test_locked_bleed_guillotine_gap_uses_production_rect():
+    # A's production rect ends at 45; B starts at 48: kerf 3 fits exactly.
+    payload = {
+        "stock": {"width": 100, "height": 50},
+        "kerf": 3,
+        "items": [
+            {"id": "A", "width": 40, "height": 50, "quantity": 1,
+             "bleed": {"right": 5}},
+            {"id": "B", "width": 40, "height": 50, "quantity": 1},
+        ],
+        "locked_placements": [
+            {"item": "A", "x": 0, "y": 0},
+            {"item": "B", "x": 48, "y": 0},
+        ],
+    }
+    body = client.post("/plans", json=payload).json()
+    check_plan(body)
+    # One unit closer and the kerf no longer fits between production rects.
+    payload["locked_placements"][1]["x"] = 47
+    assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_gripper_zone_checks_locked_production_rect():
+    # Net top edge y=12 clears the inner area start, but the 3mm top
+    # bleed reaches into the kerf strip [10, 12).
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "kerf": 2,
+        "items": [{"id": "A", "width": 40, "height": 40, "quantity": 1,
+                   "bleed": {"top": 3}}],
+        "locked_placements": [{"item": "A", "x": 0, "y": 12}],
+        "gripper_zone": {"edge": "top", "size": 10},
+    }
+    assert client.post("/plans", json=payload).status_code == 422
+
+
+def test_bleed_item_unfit_rejected():
+    payload = {
+        "stock": {"width": 100, "height": 100},
+        "items": [{"id": "A", "width": 96, "height": 96, "quantity": 1,
+                   "bleed": {"top": 4, "right": 4, "bottom": 4, "left": 4}}],
+    }
+    response = client.post("/plans", json=payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "A" in detail and "bleed" in detail
+
+
+def test_bleed_rotation_chosen_when_unrotated_production_unfit():
+    # Production rect is 70x50 unrotated (too wide for 55) and 50x70
+    # rotated, so the engine must rotate.
+    payload = {
+        "stock": {"width": 55, "height": 80},
+        "items": [{"id": "A", "width": 60, "height": 40, "quantity": 1,
+                   "bleed": {"top": 5, "right": 5, "bottom": 5, "left": 5}}],
+    }
+    body = client.post("/plans", json=payload).json()
+    check_plan(body)
+    p = body["sheets"][0]["placements"][0]
+    assert p["rotated"] is True
+    assert (p["production_rect"]["width"],
+            p["production_rect"]["height"]) == (50.0, 70.0)

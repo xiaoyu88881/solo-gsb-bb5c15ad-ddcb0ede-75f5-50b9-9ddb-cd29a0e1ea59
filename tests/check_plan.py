@@ -64,7 +64,8 @@ def check_cut_tree(node: dict, kerf: float) -> None:
 
 def check_sheet(sheet: dict, kerf: float) -> None:
     """Verify one sheet: tree structure, placements match tree leaves,
-    pieces are inside the sheet and do not overlap, utilization matches."""
+    production rects are inside the sheet and do not overlap, the net
+    rect sits inside its production rect, utilization counts net area."""
     width, height = sheet["width"], sheet["height"]
     placements = sheet["placements"]
 
@@ -73,26 +74,34 @@ def check_sheet(sheet: dict, kerf: float) -> None:
     # The reported cut count must match the actual cut tree.
     assert sheet["cut_count"] == count_cut_nodes(sheet["cut_tree"])
 
-    # Tree item leaves must be exactly the placements list.
+    # Tree item leaves cover the placements' production rectangles (the
+    # net rect itself when no bleed is reported).
     tree_items = [
         (leaf["item"], leaf["x"], leaf["y"], leaf["width"], leaf["height"],
          leaf["rotated"])
         for leaf in iter_leaves(sheet["cut_tree"])
         if leaf["type"] == "item"
     ]
-    placed = [
-        (p["item"], p["x"], p["y"], p["width"], p["height"], p["rotated"])
-        for p in placements
-    ]
+    placed = []
+    for p in placements:
+        pr = p.get("production_rect") or p
+        placed.append((p["item"], pr["x"], pr["y"], pr["width"],
+                       pr["height"], p["rotated"]))
     assert sorted(map(repr, tree_items)) == sorted(map(repr, placed))
 
-    # Bounds and pairwise overlap.
+    # Bounds and pairwise overlap of the production rectangles; the net
+    # rectangle must sit inside its production rectangle.
     rects = []
     for p in placements:
-        x2, y2 = p["x"] + p["width"], p["y"] + p["height"]
-        assert p["x"] >= -EPS and p["y"] >= -EPS
+        pr = p.get("production_rect") or p
+        assert pr["x"] <= p["x"] + EPS
+        assert pr["y"] <= p["y"] + EPS
+        assert pr["x"] + pr["width"] >= p["x"] + p["width"] - EPS
+        assert pr["y"] + pr["height"] >= p["y"] + p["height"] - EPS
+        x2, y2 = pr["x"] + pr["width"], pr["y"] + pr["height"]
+        assert pr["x"] >= -EPS and pr["y"] >= -EPS
         assert x2 <= width + EPS and y2 <= height + EPS
-        rects.append((p["x"], p["y"], x2, y2))
+        rects.append((pr["x"], pr["y"], x2, y2))
     for i in range(len(rects)):
         for j in range(i + 1, len(rects)):
             a, b = rects[i], rects[j]
@@ -102,7 +111,7 @@ def check_sheet(sheet: dict, kerf: float) -> None:
                 f"placements {i} and {j} overlap"
             )
 
-    # Utilization matches the placed area.
+    # Utilization matches the placed net (finished-size) area.
     used = sum(p["width"] * p["height"] for p in placements)
     assert abs(sheet["utilization"] - used / (width * height)) <= 1e-4
 

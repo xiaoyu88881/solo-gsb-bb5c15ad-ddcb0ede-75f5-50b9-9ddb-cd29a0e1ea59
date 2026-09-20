@@ -45,6 +45,20 @@ that separator cut counts towards ``cut_count`` and
 rectangle.  When the inner rectangle is unusable (a non-positive
 dimension), or a pinned piece enters the strip or straddles the
 separator cut, GripperZoneError is raised.
+
+Bleed (出血)
+------------
+Each item may reserve bleed margins on its four sides.  The engine then
+packs the *production rectangle* (net size plus bleed) everywhere: fit
+and rotation checks, free-rectangle splits, locked-layout
+decomposition, gripper and overlap validation.  Rotating a piece 90°
+clockwise rotates its bleed along — the margin on the item's left edge
+ends up on the top side of the sheet and so on — so the production
+rectangle is not just a width/height swap of the net size.  Locked
+placements still give the net top-left corner; the production rectangle
+is derived from it.  Item leaves of the cut tree cover the production
+rectangle, while utilization keeps counting net area only.  Items
+without bleed behave exactly as before.
 """
 from __future__ import annotations
 
@@ -63,10 +77,15 @@ class UnfitItemError(ValueError):
     """Raised when an item cannot fit on a fresh stock sheet in any orientation."""
 
     def __init__(self, item_id: str, width: float, height: float,
-                 stock_width: float, stock_height: float) -> None:
+                 stock_width: float, stock_height: float,
+                 production: tuple[float, float] | None = None) -> None:
         self.item_id = item_id
+        size = f"{width} x {height}"
+        if production is not None and production != (width, height):
+            size += (f" net, {production[0]} x {production[1]} "
+                     "including bleed")
         super().__init__(
-            f"item '{item_id}' ({width} x {height}) does not fit on stock "
+            f"item '{item_id}' ({size}) does not fit on stock "
             f"{stock_width} x {stock_height} in either orientation"
         )
 
@@ -89,17 +108,67 @@ class GripperZoneError(ValueError):
 
 
 @dataclass
+class Bleed:
+    """Bleed margins (出血) around an item's net size, in the item's own
+    frame (before rotation)."""
+
+    top: float = 0.0
+    right: float = 0.0
+    bottom: float = 0.0
+    left: float = 0.0
+
+    @property
+    def any(self) -> bool:
+        return (self.top > 0 or self.right > 0
+                or self.bottom > 0 or self.left > 0)
+
+    def rotated(self) -> "Bleed":
+        """Bleed in sheet coordinates after a 90° clockwise rotation.
+
+        The item's left edge ends up on top, its top edge on the right,
+        and so on.
+        """
+        return Bleed(top=self.left, right=self.top,
+                     bottom=self.right, left=self.bottom)
+
+
+@dataclass
 class Piece:
-    """One physical piece to place (an item expanded by its quantity)."""
+    """One physical piece to place (an item expanded by its quantity).
+
+    ``width``/``height`` are the net (finished) dimensions; the engine
+    packs the production rectangle, i.e. the net size plus ``bleed``.
+    """
 
     item_id: str
     width: float
     height: float
+    bleed: Bleed = field(default_factory=Bleed)
+
+    def net_size(self, rotated: bool) -> tuple[float, float]:
+        """Net dimensions as placed (swapped when rotated 90°)."""
+        return (self.height, self.width) if rotated else (self.width, self.height)
+
+    def sheet_bleed(self, rotated: bool) -> Bleed:
+        """Bleed margins in sheet coordinates for the given orientation."""
+        return self.bleed.rotated() if rotated else self.bleed
+
+    def production_size(self, rotated: bool) -> tuple[float, float]:
+        """Dimensions of the production rectangle the engine packs."""
+        net_w, net_h = self.net_size(rotated)
+        bleed = self.sheet_bleed(rotated)
+        return (net_w + bleed.left + bleed.right,
+                net_h + bleed.top + bleed.bottom)
 
 
 @dataclass
 class LockedPiece:
-    """A piece pinned to fixed coordinates on the first sheet."""
+    """A piece pinned to fixed coordinates on the first sheet.
+
+    ``x``/``y``/``width``/``height`` describe the production rectangle
+    (net size plus bleed), derived from the requested net top-left
+    corner; all checks and the guillotine decomposition use it.
+    """
 
     piece: Piece
     x: float
@@ -161,10 +230,23 @@ def _contains(a: Node, b: Node) -> bool:
 
 
 def _orientations(piece: Piece):
-    """Yield (width, height) pairs, unrotated first."""
-    yield piece.width, piece.height
-    if piece.width != piece.height:
-        yield piece.height, piece.width
+    """Yield (rotated, width, height) of the production rectangle,
+    unrotated first.  The rotated orientation is skipped when the
+    production rectangle is square (rotating it changes nothing)."""
+    pw, ph = piece.production_size(False)
+    yield False, pw, ph
+    rw, rh = piece.production_size(True)
+    if (rw, rh) != (pw, ph):
+        yield True, rw, rh
+
+
+def _size_desc(piece: Piece) -> str:
+    """'w x h', extended with the production size when bleed applies."""
+    desc = f"{piece.width} x {piece.height}"
+    if piece.bleed.any:
+        pw, ph = piece.production_size(False)
+        desc += f" net, {pw} x {ph} including bleed"
+    return desc
 
 
 def _split_cuts(pw: float, ph: float, width: float, height: float,
@@ -361,17 +443,15 @@ def _item_node(x: float, y: float, pw: float, ph: float,
 
 
 def _fill(node: Node, piece: Piece, pw: float, ph: float, kerf: float,
-          rotated: bool | None = None, locked_ref: int | None = None) -> list[Node]:
-    """Place a piece (pw x ph) at the top-left corner of free leaf ``node``.
+          rotated: bool, locked_ref: int | None = None) -> list[Node]:
+    """Place a piece (production rect pw x ph) at the top-left corner of
+    free leaf ``node``.
 
     Mutates ``node`` into an item leaf or a cut subtree and returns the new
     free rectangles created by the split.  Every split consumes ``kerf``
     material; remainders not wider than the kerf are discarded as trim loss.
-    ``rotated`` defaults to being derived from the piece's base dimensions.
     """
     x, y, w, h = node.x, node.y, node.width, node.height
-    if rotated is None:
-        rotated = not (pw == piece.width and ph == piece.height)
     item = _item_node(x, y, pw, ph, piece, rotated, locked_ref)
 
     right_w = w - pw - kerf    # usable width right of a vertical cut
@@ -443,7 +523,8 @@ def _best_fit(sheets: list[Sheet], piece: Piece,
               max_cuts: int | None = None):
     """Find the best placement for a piece across all open sheets.
 
-    Returns (sheet_index, free_rect_index, pw, ph) or None.  Scoring is
+    Returns (sheet_index, free_rect_index, rotated, pw, ph) or None, with
+    pw/ph the production rectangle dimensions.  Scoring is
     best-short-side-fit with best-area-fit as tie-breaker.  When
     ``max_cuts`` is set, rectangles whose split would push their sheet
     past the limit are skipped, and equal fits prefer the split adding
@@ -452,7 +533,7 @@ def _best_fit(sheets: list[Sheet], piece: Piece,
     best = None
     for si, sheet in enumerate(sheets):
         for fi, rect in enumerate(sheet.free):
-            for pw, ph in _orientations(piece):
+            for rotated, pw, ph in _orientations(piece):
                 if not _fits(pw, ph, rect.width, rect.height):
                     continue
                 if not _corner_fill_ok(pw, ph, rect.width, rect.height,
@@ -472,65 +553,88 @@ def _best_fit(sheets: list[Sheet], piece: Piece,
                         continue
                     score = (short_side, area_left, added)
                 if best is None or score < best[0]:
-                    best = (score, si, fi, pw, ph)
+                    best = (score, si, fi, rotated, pw, ph)
     if best is None:
         return None
-    _, si, fi, pw, ph = best
-    return si, fi, pw, ph
+    _, si, fi, rotated, pw, ph = best
+    return si, fi, rotated, pw, ph
 
 
-def _place(sheet: Sheet, free_idx: int, piece: Piece, pw: float, ph: float) -> None:
+def _placement_dict(piece: Piece, prod_x: float, prod_y: float,
+                    rotated: bool, locked: bool) -> dict:
+    """Placement entry: net coordinates plus the production rectangle.
+
+    ``prod_x``/``prod_y`` are the production rectangle's top-left corner
+    (where the cut tree's item leaf sits); the net rectangle is offset by
+    the sheet-frame bleed.  ``production_rect`` is only reported when the
+    item carries a non-zero bleed, keeping bleed-free responses identical.
+    """
+    bleed = piece.sheet_bleed(rotated)
+    net_w, net_h = piece.net_size(rotated)
+    placement = {
+        "item": piece.item_id,
+        "x": _num(prod_x + bleed.left),
+        "y": _num(prod_y + bleed.top),
+        "width": _num(net_w),
+        "height": _num(net_h),
+        "rotated": rotated,
+        "locked": locked,
+    }
+    if piece.bleed.any:
+        prod_w, prod_h = piece.production_size(rotated)
+        placement["production_rect"] = {
+            "x": _num(prod_x),
+            "y": _num(prod_y),
+            "width": _num(prod_w),
+            "height": _num(prod_h),
+        }
+    return placement
+
+
+def _place(sheet: Sheet, free_idx: int, piece: Piece, rotated: bool,
+           pw: float, ph: float) -> None:
     rect = sheet.free[free_idx]
     sheet.cuts += _split_cuts(pw, ph, rect.width, rect.height, sheet.kerf)
     sheet.free.pop(free_idx)
-    new_rects = _fill(rect, piece, pw, ph, sheet.kerf)
+    new_rects = _fill(rect, piece, pw, ph, sheet.kerf, rotated)
     sheet.free.extend(new_rects)
     _prune(sheet.free)
-    sheet.used_area += pw * ph
-    sheet.placements.append({
-        "item": piece.item_id,
-        "x": _num(rect.x),
-        "y": _num(rect.y),
-        "width": _num(pw),
-        "height": _num(ph),
-        "rotated": not (pw == piece.width and ph == piece.height),
-        "locked": False,
-    })
+    sheet.used_area += piece.width * piece.height  # net area only
+    sheet.placements.append(
+        _placement_dict(piece, rect.x, rect.y, rotated, locked=False))
 
 
 def _fresh_orientation(piece: Piece, stock_width: float, stock_height: float,
                        kerf: float, max_cuts: int | None):
-    """Pick (width, height) for a piece starting a blank sheet.
+    """Pick (rotated, width, height) for a piece starting a blank sheet.
 
-    Without a cut limit the unrotated orientation is preferred (a fresh
-    sheet always fits; sizes are checked up front).  With a limit,
-    orientations whose split would exceed it are discarded and the one
-    needing the fewest cuts wins, unrotated on ties, leaving cut budget
-    for the pieces that follow.
+    Sizes are production rectangle dimensions.  Without a cut limit the
+    first fitting orientation wins (unrotated preferred; a fresh sheet
+    always fits, sizes are checked up front).  With a limit, orientations
+    whose split would exceed it are discarded and the one needing the
+    fewest cuts wins, unrotated on ties, leaving cut budget for the
+    pieces that follow.
     """
+    fitting = [(rotated, pw, ph) for rotated, pw, ph in _orientations(piece)
+               if _fits(pw, ph, stock_width, stock_height)]
     if max_cuts is None:
-        pw, ph = piece.width, piece.height
-        if not _fits(pw, ph, stock_width, stock_height):
-            pw, ph = ph, pw
-        return pw, ph
+        return fitting[0]
     best = None
-    for pw, ph in _orientations(piece):
-        if not _fits(pw, ph, stock_width, stock_height):
-            continue
+    for rotated, pw, ph in fitting:
         cuts = _split_cuts(pw, ph, stock_width, stock_height, kerf)
         if cuts > max_cuts:
             continue
         if best is None or cuts < best[0]:
-            best = (cuts, pw, ph)
+            best = (cuts, rotated, pw, ph)
     if best is None:
         # Every item is checked against a blank sheet up front, so a
         # fitting orientation within the limit always exists here.
         raise CutLimitError(
-            f"item '{piece.item_id}' ({piece.width} x {piece.height}) cannot "
-            f"be cut from a fresh sheet {stock_width} x {stock_height} "
-            f"within max_cuts_per_sheet {max_cuts}"
+            f"item '{piece.item_id}' ({_size_desc(piece)}) cannot be cut "
+            f"from a fresh sheet {stock_width} x {stock_height} within "
+            f"max_cuts_per_sheet {max_cuts}"
         )
-    return best[1], best[2]
+    return best[1], best[2], best[3]
 
 
 # ---------------------------------------------------------------------------
@@ -821,21 +925,29 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
                items: list[tuple[str, float, float, int]],
                locked: list[tuple[str, float, float, bool, int]] | None = None,
                max_cuts_per_sheet: int | None = None,
-               gripper: tuple[str, float] | None = None
+               gripper: tuple[str, float] | None = None,
+               bleeds: dict[str, tuple[float, float, float, float]] | None = None
                ) -> dict:
     """Pack ``items`` (id, width, height, quantity) onto stock sheets.
 
     ``locked`` optionally pins pieces on the first sheet; each tuple is
-    (item_id, x, y, rotated, request_index).  Locked pieces count towards
-    their item's quantity.  ``max_cuts_per_sheet`` caps the number of cuts
-    (cut nodes) in any sheet's tree; the locked layout on the first sheet
-    counts towards the cap.  ``gripper`` optionally reserves a full-span
-    strip (edge, size) on every sheet: the strip is cut off as permanent
-    waste with one kerf-consuming cut before any packing.  Returns a dict
-    matching the PlanResponse schema.  Raises UnfitItemError if any item
-    cannot fit on a fresh sheet, CutLimitError if the cut cap cannot be
-    honoured, LockedLayoutError if the pinned layout is invalid, or
-    GripperZoneError if the gripper strip cannot be honoured.
+    (item_id, x, y, rotated, request_index) with x/y the *net* top-left
+    corner.  Locked pieces count towards their item's quantity.
+    ``max_cuts_per_sheet`` caps the number of cuts (cut nodes) in any
+    sheet's tree; the locked layout on the first sheet counts towards
+    the cap.  ``gripper`` optionally reserves a full-span strip
+    (edge, size) on every sheet: the strip is cut off as permanent waste
+    with one kerf-consuming cut before any packing.  ``bleeds``
+    optionally maps an item id to its bleed margins
+    (top, right, bottom, left): the engine then packs each piece's
+    *production rectangle* (net size plus bleed, rotating with the
+    piece), derives locked production rectangles from the net
+    coordinates, and reports the rectangle as ``production_rect`` in the
+    placements; utilization keeps counting net area only.  Returns a
+    dict matching the PlanResponse schema.  Raises UnfitItemError if any
+    item cannot fit on a fresh sheet, CutLimitError if the cut cap
+    cannot be honoured, LockedLayoutError if the pinned layout is
+    invalid, or GripperZoneError if the gripper strip cannot be honoured.
     """
     zone: GripperZone | None = None
     if gripper is not None:
@@ -845,32 +957,44 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     else:
         avail_w, avail_h = stock_width, stock_height
 
+    bleeds = bleeds or {}
     catalog: dict[str, Piece] = {}
     for item_id, width, height, quantity in items:
-        piece = Piece(item_id, width, height)
-        orientations = [(pw, ph) for pw, ph in _orientations(piece)
+        top, right, bottom, left = bleeds.get(item_id, (0.0, 0.0, 0.0, 0.0))
+        piece = Piece(item_id, float(width), float(height),
+                      Bleed(top=float(top), right=float(right),
+                            bottom=float(bottom), left=float(left)))
+        orientations = [(rotated, pw, ph)
+                        for rotated, pw, ph in _orientations(piece)
                         if _fits(pw, ph, avail_w, avail_h)]
         if not orientations:
-            if zone is not None and (
-                    _fits(width, height, stock_width, stock_height)
-                    or _fits(height, width, stock_width, stock_height)):
+            fits_stock = any(
+                _fits(pw, ph, stock_width, stock_height)
+                for _, pw, ph in _orientations(piece)
+            )
+            if zone is not None and fits_stock:
                 raise GripperZoneError(
-                    f"item '{item_id}' ({width} x {height}) does not fit in "
+                    f"item '{item_id}' ({_size_desc(piece)}) does not fit in "
                     f"the {_num(avail_w)} x {_num(avail_h)} area left by the "
-                    f"gripper_zone (edge '{zone.edge}', size {_num(zone.size)}"
-                    f", kerf {kerf}) on stock {stock_width} x {stock_height}"
+                    f"gripper_zone (edge '{zone.edge}', size "
+                    f"{_num(zone.size)}, kerf {kerf}) on stock "
+                    f"{stock_width} x {stock_height}"
                 )
-            raise UnfitItemError(item_id, width, height, stock_width, stock_height)
+            raise UnfitItemError(
+                item_id, width, height, stock_width, stock_height,
+                production=(piece.production_size(False)
+                            if piece.bleed.any else None),
+            )
         if max_cuts_per_sheet is not None:
             # One extra cut on every sheet separates the gripper strip.
             base_cuts = 1 if zone is not None else 0
             min_cuts = base_cuts + min(
                 _split_cuts(pw, ph, avail_w, avail_h, kerf)
-                for pw, ph in orientations
+                for _, pw, ph in orientations
             )
             if min_cuts > max_cuts_per_sheet:
                 raise CutLimitError(
-                    f"item '{item_id}' ({width} x {height}) needs at least "
+                    f"item '{item_id}' ({_size_desc(piece)}) needs at least "
                     f"{min_cuts} cuts on a fresh sheet {stock_width} x "
                     f"{stock_height}, exceeding max_cuts_per_sheet "
                     f"{max_cuts_per_sheet}"
@@ -881,19 +1005,31 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     for item_id, x, y, rotated, ref in locked or []:
         x, y = float(x), float(y)
         piece = catalog[item_id]
-        pw, ph = (piece.height, piece.width) if rotated else (
-            piece.width, piece.height)
-        if (x < -EPS or y < -EPS
-                or x + pw > stock_width + EPS
-                or y + ph > stock_height + EPS):
+        rotated = bool(rotated)
+        # x/y pin the net top-left corner; derive the production
+        # rectangle (net size plus bleed) used by every check below.
+        bleed = piece.sheet_bleed(rotated)
+        pw, ph = piece.production_size(rotated)
+        px, py = x - bleed.left, y - bleed.top
+        if (px < -EPS or py < -EPS
+                or px + pw > stock_width + EPS
+                or py + ph > stock_height + EPS):
+            if piece.bleed.any:
+                raise LockedLayoutError(
+                    f"locked placement #{ref} item '{item_id}' at "
+                    f"({_num(x)}, {_num(y)}) places its production "
+                    f"rectangle ({_num(pw)} x {_num(ph)} at ({_num(px)}, "
+                    f"{_num(py)})) outside the stock "
+                    f"{stock_width} x {stock_height}"
+                )
             raise LockedLayoutError(
                 f"locked placement #{ref} item '{item_id}' at ({_num(x)}, "
                 f"{_num(y)}) ({_num(pw)} x {_num(ph)}) is outside the stock "
                 f"{stock_width} x {stock_height}"
             )
         lp = LockedPiece(
-            piece=piece, x=x, y=y, width=pw, height=ph,
-            rotated=bool(rotated), ref=ref,
+            piece=piece, x=px, y=py, width=pw, height=ph,
+            rotated=rotated, ref=ref,
         )
         if zone is not None:
             _check_locked_gripper(lp, zone, kerf)
@@ -917,7 +1053,7 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
     for item_id, width, height, quantity in items:
         locked_count = sum(1 for lp in locked_pieces
                            if lp.piece.item_id == item_id)
-        remaining.extend(Piece(item_id, width, height)
+        remaining.extend(catalog[item_id]
                          for _ in range(quantity - locked_count))
 
     sheets: list[Sheet] = []
@@ -953,20 +1089,17 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
         sheet.free.extend(free_rects)
         _prune(sheet.free)
         for lp in sorted(locked_pieces, key=lambda p: (p.y, p.x)):
-            sheet.used_area += lp.width * lp.height
-            sheet.placements.append({
-                "item": lp.piece.item_id,
-                "x": _num(lp.x),
-                "y": _num(lp.y),
-                "width": _num(lp.width),
-                "height": _num(lp.height),
-                "rotated": lp.rotated,
-                "locked": True,
-            })
+            sheet.used_area += lp.piece.width * lp.piece.height  # net area
+            sheet.placements.append(
+                _placement_dict(lp.piece, lp.x, lp.y, lp.rotated,
+                                locked=True))
 
-    # Largest first: longer max side, then larger area.
-    remaining.sort(key=lambda p: (max(p.width, p.height), p.width * p.height),
-                   reverse=True)
+    # Largest first: longer max side, then larger area (production sizes).
+    def _sort_key(piece: Piece):
+        pw, ph = piece.production_size(False)
+        return max(pw, ph), pw * ph
+
+    remaining.sort(key=_sort_key, reverse=True)
 
     def _new_sheet(piece: Piece) -> None:
         """Open a fresh sheet (with its gripper strip pre-cut when set) and
@@ -980,27 +1113,28 @@ def build_plan(stock_width: float, stock_height: float, kerf: float,
             # The separator cut already spent one unit of the budget.
             inner_limit = (max_cuts_per_sheet - 1
                            if max_cuts_per_sheet is not None else None)
-            pw, ph = _fresh_orientation(piece, avail_w, avail_h, kerf,
-                                        inner_limit)
+            rotated, pw, ph = _fresh_orientation(piece, avail_w, avail_h,
+                                                 kerf, inner_limit)
             sheets.append(sheet)
-            _place(sheet, 0, piece, pw, ph)
+            _place(sheet, 0, piece, rotated, pw, ph)
         else:
             root = Node(kind="free", x=0.0, y=0.0,
                         width=stock_width, height=stock_height)
             sheet = Sheet(width=stock_width, height=stock_height, kerf=kerf,
                           root=root, free=[root])
             sheets.append(sheet)
-            pw, ph = _fresh_orientation(piece, stock_width, stock_height,
-                                        kerf, max_cuts_per_sheet)
-            _place(sheet, 0, piece, pw, ph)
+            rotated, pw, ph = _fresh_orientation(piece, stock_width,
+                                                 stock_height, kerf,
+                                                 max_cuts_per_sheet)
+            _place(sheet, 0, piece, rotated, pw, ph)
 
     for piece in remaining:
         found = _best_fit(sheets, piece, max_cuts_per_sheet)
         if found is None:
             _new_sheet(piece)
         else:
-            si, fi, pw, ph = found
-            _place(sheets[si], fi, piece, pw, ph)
+            si, fi, rotated, pw, ph = found
+            _place(sheets[si], fi, piece, rotated, pw, ph)
 
     sheet_area = stock_width * stock_height
     result_sheets = []
